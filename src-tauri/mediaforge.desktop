@@ -2,10 +2,24 @@
 Version=1.0
 Type=Application
 Name=MediaForge
-Comment=YouTube Downloader & Media Converter
-Exec=mediaforge
+GenericName=Media Converter
+Comment=YouTube Downloader & Media Converter optimized for Arch Linux + Hyprland
+Exec=mediaforge %f
 Icon=mediaforge
 Terminal=false
-Categories=AudioVideo;Audio;Video;Network;
-Keywords=youtube;download;converter;media;
+Categories=AudioVideo;Audio;Video;Network;Utility;
+Keywords=youtube;download;converter;media;video;audio;yt-dlp;ffmpeg;imagemagick;
 StartupWMClass=MediaForge
+MimeType=video/mp4;video/x-msvideo;video/quicktime;video/x-matroska;video/webm;audio/mpeg;audio/x-wav;audio/ogg;audio/flac;image/png;image/jpeg;image/webp;image/gif;
+StartupNotify=true
+Actions=Download;Convert;
+
+[Desktop Action Download]
+Name=Download Video
+Exec=mediaforge --mode=download
+Icon=mediaforge
+
+[Desktop Action Convert]
+Name=Convert Media
+Exec=mediaforge --mode=convert
+Icon=mediaforge
