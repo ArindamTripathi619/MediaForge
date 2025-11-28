@@ -1,20 +1,30 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
+  "description": "MediaForge secure permissions - restricted to user directories only",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "dialog:allow-message",
+    "dialog:allow-message", 
     "dialog:allow-save",
     "fs:allow-read-file",
-    "fs:allow-read-dir",
+    "fs:allow-read-dir", 
     "fs:allow-write-file",
     "fs:allow-exists",
-    "shell:allow-execute",
+    "fs:allow-create",
+    "fs:allow-mkdir",
+    "fs:scope-download-recursive",
+    "fs:scope-video-recursive", 
+    "fs:scope-audio-recursive",
+    "fs:scope-picture-recursive",
+    "fs:scope-document-recursive",
+    "fs:scope-desktop-recursive",
+    "fs:allow-home-read-recursive",
+    "fs:deny-webview-data-linux",
+    "fs:deny-webview-data-windows",
     "shell:allow-open",
     "notification:default"
   ]
