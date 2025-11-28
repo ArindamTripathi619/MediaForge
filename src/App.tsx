@@ -4,6 +4,8 @@ import DownloadSection from './components/DownloadSection';
 import ConvertSection from './components/ConvertSection';
 import DownloadQueue from './components/DownloadQueue';
 import SplashScreen from './components/SplashScreen';
+import ErrorBoundary from './components/ErrorBoundary';
+import { ToastProvider } from './contexts/ToastContext';
 
 type ActiveSection = 'download' | 'convert';
 
@@ -16,23 +18,27 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
-      <Header activeSection={activeSection} onSectionChange={setActiveSection} />
+    <ErrorBoundary>
+      <ToastProvider>
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
+          <Header activeSection={activeSection} onSectionChange={setActiveSection} />
 
-      <div className="flex h-[calc(100vh-64px)]">
-        <main className="flex-1 overflow-y-auto min-w-0">
-          <div className="w-full max-w-full px-4 sm:px-6 lg:px-8 py-6 lg:py-8">
-            {activeSection === 'download' ? (
-              <DownloadSection />
-            ) : (
-              <ConvertSection />
-            )}
+          <div className="flex h-[calc(100vh-64px)]">
+            <main className="flex-1 overflow-y-auto min-w-0">
+              <div className="w-full max-w-full px-4 sm:px-6 lg:px-8 py-6 lg:py-8">
+                {activeSection === 'download' ? (
+                  <DownloadSection />
+                ) : (
+                  <ConvertSection />
+                )}
+              </div>
+            </main>
+
+            <DownloadQueue />
           </div>
-        </main>
-
-        <DownloadQueue />
-      </div>
-    </div>
+        </div>
+      </ToastProvider>
+    </ErrorBoundary>
   );
 }
 

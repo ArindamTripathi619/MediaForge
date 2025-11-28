@@ -2,10 +2,13 @@ import { useState } from 'react';
 import { Upload, Image, Film, Headphones, FileType, FolderOpen } from 'lucide-react';
 import { TauriAPI } from '../api/tauri';
 import type { ConversionType } from '../types/tauri';
+import { useToastContext } from '../contexts/ToastContext';
+import { validateFileSize, validateOutputPath } from '../utils/validation';
 
 type MediaType = 'Image' | 'Video' | 'Audio';
 
 function ConvertSection() {
+  const { warning, success, error } = useToastContext();
   const [mediaType, setMediaType] = useState<ConversionType>('Video');
   const [outputFormat, setOutputFormat] = useState('mp4');
   const [outputPath, setOutputPath] = useState('~/Downloads');
@@ -45,6 +48,36 @@ function ConvertSection() {
     }
   };
 
+  const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    
+    // Validate file sizes
+    const maxSize = mediaType === 'Video' ? 5 * 1024 * 1024 * 1024 : 2 * 1024 * 1024 * 1024; // 5GB for video, 2GB for others
+    const invalidFiles = files.filter(file => {
+      const sizeValidation = validateFileSize(file.size, maxSize);
+      return !sizeValidation.isValid;
+    });
+
+    if (invalidFiles.length > 0) {
+      const invalidFile = invalidFiles[0];
+      const sizeValidation = validateFileSize(invalidFile.size, maxSize);
+      warning('File Too Large', `${invalidFile.name}: ${sizeValidation.message}`);
+      return;
+    }
+
+    // Convert File objects to paths (we'll use the name for display)
+    // Note: In a real desktop app, we'd need to handle this differently
+    const filePaths = files.map(file => file.name);
+    setSelectedFiles(filePaths);
+    
+    success('Files Added', `Added ${files.length} file(s) for conversion`);
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+  };
+
   const handleSelectDirectory = async () => {
     try {
       const selected = await TauriAPI.selectDirectory();
@@ -58,7 +91,14 @@ function ConvertSection() {
 
   const handleStartConversion = async () => {
     if (selectedFiles.length === 0) {
-      alert('Please select files to convert');
+      warning('No Files Selected', 'Please select files to convert');
+      return;
+    }
+
+    // Validate output path
+    const pathValidation = validateOutputPath(outputPath);
+    if (!pathValidation.isValid) {
+      warning('Invalid Output Path', pathValidation.message || 'Please select a valid output directory');
       return;
     }
 
@@ -107,10 +147,10 @@ function ConvertSection() {
       setSelectedFiles([]);
       setCustomWidth('');
       setCustomHeight('');
-      alert(`Started ${taskIds.length} conversion(s) successfully!`);
-    } catch (error) {
-      console.error('Conversion failed:', error);
-      alert(`Failed to start conversion: ${error}`);
+      success('Conversion Started', `Started ${taskIds.length} conversion(s) successfully!`);
+    } catch (err) {
+      console.error('Conversion failed:', err);
+      error('Conversion Failed', `Failed to start conversion: ${err}`);
     } finally {
       setIsConverting(false);
     }
@@ -156,6 +196,8 @@ function ConvertSection() {
           <label className="block text-xs sm:text-sm font-medium text-slate-300 mb-2 sm:mb-3">Select Files</label>
           <div 
             onClick={handleSelectFiles}
+            onDrop={handleFileDrop}
+            onDragOver={handleDragOver}
             className="border-2 border-dashed border-slate-600 rounded-lg sm:rounded-xl p-4 sm:p-12 text-center hover:border-cyan-500 hover:bg-slate-800/30 transition-all cursor-pointer group"
           >
             <div className="flex flex-col items-center gap-2 sm:gap-3">
@@ -167,7 +209,7 @@ function ConvertSection() {
                   {selectedFiles.length > 0 ? `${selectedFiles.length} file(s) selected` : 'Drop files or click'}
                 </p>
                 <p className="text-xs text-slate-500 mt-1">
-                  Multiple files supported
+                  Multiple files supported • Max: {mediaType === 'Video' ? '5GB' : '2GB'} per file
                 </p>
               </div>
             </div>

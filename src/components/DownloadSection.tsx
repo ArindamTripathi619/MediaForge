@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { Link, Music, Video, List, Scissors, FolderOpen, Plus, X } from 'lucide-react';
 import { TauriAPI } from '../api/tauri';
+import { useToastContext } from '../contexts/ToastContext';
+import { validateUrls, validateTimeRange, validateOutputPath } from '../utils/validation';
 import type { DownloadType, MediaFormat } from '../types/tauri';
 
 function DownloadSection() {
@@ -14,17 +16,56 @@ function DownloadSection() {
   const [endTime, setEndTime] = useState('00:00:00');
   const [downloadPath, setDownloadPath] = useState('~/Downloads');
   const [isDownloading, setIsDownloading] = useState(false);
+  const [urlValidationResults, setUrlValidationResults] = useState<{ isValid: boolean; message?: string }[]>([{ isValid: true }]);
+  const [timeValidationError, setTimeValidationError] = useState<string | null>(null);
+  
+  const { success, error, warning } = useToastContext();
 
-  const addUrlField = () => setUrls([...urls, '']);
+  const addUrlField = () => {
+    setUrls([...urls, '']);
+    setUrlValidationResults([...urlValidationResults, { isValid: true }]);
+  };
+  
   const removeUrlField = (index: number) => {
     if (urls.length > 1) {
       setUrls(urls.filter((_, i) => i !== index));
+      setUrlValidationResults(urlValidationResults.filter((_, i) => i !== index));
     }
   };
+  
   const updateUrl = (index: number, value: string) => {
     const newUrls = [...urls];
     newUrls[index] = value;
     setUrls(newUrls);
+    
+    // Validate URLs and update results
+    const { results } = validateUrls(newUrls);
+    setUrlValidationResults(results);
+  };
+
+  const updateStartTime = (value: string) => {
+    setStartTime(value);
+    validateTimeInputs(value, endTime);
+  };
+
+  const updateEndTime = (value: string) => {
+    setEndTime(value);
+    validateTimeInputs(startTime, value);
+  };
+
+  const validateTimeInputs = (start: string, end: string) => {
+    if (!enableTrim) {
+      setTimeValidationError(null);
+      return;
+    }
+
+    if (start.trim() === '' || end.trim() === '') {
+      setTimeValidationError(null);
+      return;
+    }
+
+    const timeValidation = validateTimeRange(start, end);
+    setTimeValidationError(timeValidation.isValid ? null : timeValidation.message || 'Invalid time range');
   };
 
   const handleSelectDirectory = async () => {
@@ -39,10 +80,36 @@ function DownloadSection() {
   };
 
   const handleStartDownload = async () => {
+    // Validate URLs
+    const { results, hasErrors } = validateUrls(urls);
+    setUrlValidationResults(results);
+    
+    if (hasErrors) {
+      const firstError = results.find(result => !result.isValid);
+      warning('Invalid URLs', firstError?.message || 'Please fix the invalid URLs');
+      return;
+    }
+    
     const validUrls = urls.filter(url => url.trim() !== '');
     if (validUrls.length === 0) {
-      alert('Please enter at least one valid URL');
+      warning('No URLs', 'Please enter at least one valid URL');
       return;
+    }
+    
+    // Validate output path
+    const pathValidation = validateOutputPath(downloadPath);
+    if (!pathValidation.isValid) {
+      warning('Invalid Path', pathValidation.message || 'Please select a valid output directory');
+      return;
+    }
+    
+    // Validate time range if trim is enabled
+    if (enableTrim) {
+      const timeValidation = validateTimeRange(startTime, endTime);
+      if (!timeValidation.isValid) {
+        warning('Invalid Time Range', timeValidation.message || 'Please check your start and end times');
+        return;
+      }
     }
 
     setIsDownloading(true);
@@ -66,10 +133,10 @@ function DownloadSection() {
       // Reset form
       setUrls(['']);
       setEnableTrim(false);
-      alert(`Started ${taskIds.length} download(s) successfully!`);
-    } catch (error) {
-      console.error('Download failed:', error);
-      alert(`Failed to start download: ${error}`);
+      success('Download Started', `Started ${taskIds.length} download(s) successfully!`);
+    } catch (err) {
+      console.error('Download failed:', err);
+      error('Download Failed', `Failed to start download: ${err}`);
     } finally {
       setIsDownloading(false);
     }
@@ -136,25 +203,41 @@ function DownloadSection() {
             {downloadType === 'Playlist' ? 'Playlist URL' : downloadType === 'Bulk' ? 'URLs' : 'URL'}
           </label>
           <div className="space-y-2 sm:space-y-3">
-            {(downloadType === 'Bulk' ? urls : urls.slice(0, 1)).map((url, index) => (
-              <div key={index} className="flex gap-2 min-w-0">
-                <input
-                  type="text"
-                  value={url}
-                  onChange={(e) => updateUrl(index, e.target.value)}
-                  placeholder={`Enter ${downloadType === 'Playlist' ? 'playlist' : 'video'} URL`}
-                  className="flex-1 min-w-0 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm bg-slate-900/50 border border-slate-600 rounded-lg focus:outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 transition-all"
-                />
-                {downloadType === 'Bulk' && urls.length > 1 && (
-                  <button
-                    onClick={() => removeUrlField(index)}
-                    className="flex-shrink-0 px-2 sm:px-3 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 rounded-lg transition-all"
-                  >
-                    <X className="w-4 h-4 sm:w-5 sm:h-5" />
-                  </button>
-                )}
-              </div>
-            ))}
+            {(downloadType === 'Bulk' ? urls : urls.slice(0, 1)).map((url, index) => {
+              const validationResult = urlValidationResults[index] || { isValid: true };
+              const hasError = url.trim() !== '' && !validationResult.isValid;
+              
+              return (
+                <div key={index} className="space-y-1">
+                  <div className="flex gap-2 min-w-0">
+                    <input
+                      type="text"
+                      value={url}
+                      onChange={(e) => updateUrl(index, e.target.value)}
+                      placeholder={`Enter ${downloadType === 'Playlist' ? 'playlist' : 'video'} URL`}
+                      className={`flex-1 min-w-0 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm bg-slate-900/50 border rounded-lg focus:outline-none focus:ring-2 transition-all ${
+                        hasError 
+                          ? 'border-red-500 focus:border-red-500 focus:ring-red-500/20' 
+                          : 'border-slate-600 focus:border-cyan-500 focus:ring-cyan-500/20'
+                      }`}
+                    />
+                    {downloadType === 'Bulk' && urls.length > 1 && (
+                      <button
+                        onClick={() => removeUrlField(index)}
+                        className="flex-shrink-0 px-2 sm:px-3 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 rounded-lg transition-all"
+                      >
+                        <X className="w-4 h-4 sm:w-5 sm:h-5" />
+                      </button>
+                    )}
+                  </div>
+                  {hasError && (
+                    <p className="text-xs text-red-400 ml-1">
+                      {validationResult.message}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
           {downloadType === 'Bulk' && (
             <button
@@ -238,27 +321,45 @@ function DownloadSection() {
           </label>
 
           {enableTrim && (
-            <div className="mt-3 sm:mt-4 grid grid-cols-2 gap-2 sm:gap-4 pl-4 sm:pl-8">
-              <div className="min-w-0">
-                <label className="block text-xs text-slate-400 mb-1 sm:mb-2">Start</label>
-                <input
-                  type="text"
-                  value={startTime}
-                  onChange={(e) => setStartTime(e.target.value)}
-                  placeholder="00:00:00"
-                  className="w-full px-2 sm:px-4 py-1.5 sm:py-2 text-xs sm:text-sm bg-slate-900/50 border border-slate-600 rounded-lg focus:outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 transition-all"
-                />
+            <div className="mt-3 sm:mt-4 space-y-2 pl-4 sm:pl-8">
+              <div className="grid grid-cols-2 gap-2 sm:gap-4">
+                <div className="min-w-0">
+                  <label className="block text-xs text-slate-400 mb-1 sm:mb-2">Start</label>
+                  <input
+                    type="text"
+                    value={startTime}
+                    onChange={(e) => updateStartTime(e.target.value)}
+                    placeholder="00:00:00"
+                    className={`w-full px-2 sm:px-4 py-1.5 sm:py-2 text-xs sm:text-sm bg-slate-900/50 border rounded-lg focus:outline-none focus:ring-2 transition-all ${
+                      timeValidationError 
+                        ? 'border-red-500 focus:border-red-500 focus:ring-red-500/20' 
+                        : 'border-slate-600 focus:border-cyan-500 focus:ring-cyan-500/20'
+                    }`}
+                  />
+                </div>
+                <div className="min-w-0">
+                  <label className="block text-xs text-slate-400 mb-1 sm:mb-2">End</label>
+                  <input
+                    type="text"
+                    value={endTime}
+                    onChange={(e) => updateEndTime(e.target.value)}
+                    placeholder="00:00:00"
+                    className={`w-full px-2 sm:px-4 py-1.5 sm:py-2 text-xs sm:text-sm bg-slate-900/50 border rounded-lg focus:outline-none focus:ring-2 transition-all ${
+                      timeValidationError 
+                        ? 'border-red-500 focus:border-red-500 focus:ring-red-500/20' 
+                        : 'border-slate-600 focus:border-cyan-500 focus:ring-cyan-500/20'
+                    }`}
+                  />
+                </div>
               </div>
-              <div className="min-w-0">
-                <label className="block text-xs text-slate-400 mb-1 sm:mb-2">End</label>
-                <input
-                  type="text"
-                  value={endTime}
-                  onChange={(e) => setEndTime(e.target.value)}
-                  placeholder="00:00:00"
-                  className="w-full px-2 sm:px-4 py-1.5 sm:py-2 text-xs sm:text-sm bg-slate-900/50 border border-slate-600 rounded-lg focus:outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 transition-all"
-                />
-              </div>
+              {timeValidationError && (
+                <p className="text-xs text-red-400 ml-1">
+                  {timeValidationError}
+                </p>
+              )}
+              <p className="text-xs text-slate-500">
+                Format: HH:MM:SS, MM:SS, or SS (seconds)
+              </p>
             </div>
           )}
         </div>
