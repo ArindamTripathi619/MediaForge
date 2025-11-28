@@ -45,6 +45,7 @@ pub fn run() {
             start_conversion,
             get_conversion_tasks,
             cancel_conversion,
+            open_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

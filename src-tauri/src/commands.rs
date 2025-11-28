@@ -111,3 +111,43 @@ pub async fn select_directory() -> Result<String, String> {
     // This will be handled by the frontend using @tauri-apps/plugin-dialog
     Err("Use dialog plugin from frontend".to_string())
 }
+
+#[tauri::command]
+pub async fn open_folder(path: String) -> Result<(), String> {
+    use std::process::Command;
+    
+    // Extract directory path if a file path is provided
+    let folder_path = std::path::Path::new(&path);
+    let folder = if folder_path.is_file() {
+        folder_path.parent().unwrap_or(folder_path)
+    } else {
+        folder_path
+    };
+    
+    // Open folder based on OS
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(folder)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(folder)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(folder)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+    
+    Ok(())
+}

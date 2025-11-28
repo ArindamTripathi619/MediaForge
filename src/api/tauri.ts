@@ -56,6 +56,11 @@ export class TauriAPI {
     return invoke<void>('cancel_conversion', { taskId });
   }
 
+  // File system operations
+  static async openFolder(path: string): Promise<void> {
+    return invoke<void>('open_folder', { path });
+  }
+
   // File dialog
   static async selectDirectory(): Promise<string | null> {
     try {

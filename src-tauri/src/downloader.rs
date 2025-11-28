@@ -96,12 +96,16 @@ impl DownloadManager {
         });
 
         let output_path = PathBuf::from(&request.download_path);
+        let format_ext = match request.format {
+            MediaFormat::Mp4 => "mp4",
+            MediaFormat::Mp3 => "mp3",
+        };
         
         // Build yt-dlp command
         let mut cmd = TokioCommand::new("yt-dlp");
         
-        // Set output template
-        let output_template = output_path.join("%(title)s.%(ext)s");
+        // Set output template with the correct extension
+        let output_template = output_path.join(format!("%(title)s.{}", format_ext));
         cmd.arg("-o").arg(output_template.to_string_lossy().to_string());
 
         // Set format based on user selection
@@ -177,10 +181,12 @@ impl DownloadManager {
                     let _ = app_handle_clone.emit("task-update", manager.get_task(&task_id_str));
                 }
 
-                // Extract filename
-                if line.contains("[download] Destination:") {
-                    if let Some(file_path) = line.split("Destination:").nth(1) {
-                        let file_path = file_path.trim().to_string();
+                // Extract filename - look for the final merged/converted file
+                if line.contains("[download] Destination:") || line.contains("[Merger]") || line.contains("[ExtractAudio]") {
+                    if let Some(file_path) = line.split("Destination:").nth(1)
+                        .or_else(|| line.split("Merging formats into").nth(1))
+                        .or_else(|| line.split("to:").nth(1)) {
+                        let file_path = file_path.trim().trim_matches('"').to_string();
                         manager.update_task(&task_id_str, |task| {
                             task.file_path = Some(file_path.clone());
                             task.name = file_path;

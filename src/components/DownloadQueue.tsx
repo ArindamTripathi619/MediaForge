@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { ChevronRight, ChevronLeft, Pause, X, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronLeft, Pause, X, CheckCircle, AlertCircle, Loader2, FolderOpen } from 'lucide-react';
 import { TauriAPI } from '../api/tauri';
 import type { TaskProgress, TaskStatus } from '../types/tauri';
 
@@ -69,6 +69,14 @@ function DownloadQueue() {
       setTasks(prevTasks => prevTasks.filter(t => t.task_id !== taskId));
     } catch (error) {
       console.error('Failed to remove task:', error);
+    }
+  };
+
+  const handleOpenFolder = async (filePath: string) => {
+    try {
+      await TauriAPI.openFolder(filePath);
+    } catch (error) {
+      console.error('Failed to open folder:', error);
     }
   };
 
@@ -150,10 +158,20 @@ function DownloadQueue() {
                       </p>
                     </div>
                     <div className="flex gap-1 flex-shrink-0">
+                      {task.status === 'Completed' && task.file_path && (
+                        <button 
+                          onClick={() => handleOpenFolder(task.file_path!)}
+                          className="p-0.5 hover:bg-slate-700 rounded transition-all"
+                          title="Open folder"
+                        >
+                          <FolderOpen className="w-3 h-3 lg:w-3.5 lg:h-3.5 text-cyan-400" />
+                        </button>
+                      )}
                       {task.status === 'Downloading' && (
                         <button 
                           onClick={() => handlePause(task.task_id)}
                           className="p-0.5 hover:bg-slate-700 rounded transition-all"
+                          title="Pause"
                         >
                           <Pause className="w-3 h-3 lg:w-3.5 lg:h-3.5 text-slate-400" />
                         </button>
@@ -162,6 +180,7 @@ function DownloadQueue() {
                         <button 
                           onClick={() => handleCancel(task.task_id)}
                           className="p-0.5 hover:bg-slate-700 rounded transition-all"
+                          title="Cancel"
                         >
                           <X className="w-3 h-3 lg:w-3.5 lg:h-3.5 text-slate-400" />
                         </button>
@@ -170,6 +189,7 @@ function DownloadQueue() {
                         <button 
                           onClick={() => handleRemove(task.task_id)}
                           className="p-0.5 hover:bg-slate-700 rounded transition-all"
+                          title="Remove"
                         >
                           <X className="w-3 h-3 lg:w-3.5 lg:h-3.5 text-slate-400" />
                         </button>
