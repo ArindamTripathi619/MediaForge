@@ -2,6 +2,7 @@ use crate::error::MediaForgeError;
 use crate::notifications;
 use crate::types::*;
 use dashmap::DashMap;
+use regex::Regex;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,6 +10,157 @@ use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
+
+/// Validates input file paths to ensure they exist and are not system files
+fn validate_input_file(file_path: &PathBuf) -> Result<(), MediaForgeError> {
+    // Check if file exists
+    if !file_path.exists() {
+        return Err(MediaForgeError::FileSystemError(
+            format!("Input file does not exist: {}", file_path.display())
+        ));
+    }
+    
+    // Check if it's actually a file (not directory)
+    if !file_path.is_file() {
+        return Err(MediaForgeError::FileSystemError(
+            format!("Path is not a file: {}", file_path.display())
+        ));
+    }
+    
+    // Prevent access to system files
+    let path_str = file_path.to_string_lossy();
+    if path_str.starts_with("/etc") 
+        || path_str.starts_with("/sys") 
+        || path_str.starts_with("/proc")
+        || path_str.starts_with("/boot")
+        || path_str.starts_with("/root")
+        || path_str.contains("/.ssh/")
+        || path_str.contains("/.gnupg/")
+    {
+        return Err(MediaForgeError::InvalidSettings(
+            "Access to system files is not allowed".into()
+        ));
+    }
+    
+    // Validate file extension for security (prevent executable files)
+    if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        let dangerous_extensions = [
+            "sh", "bash", "zsh", "fish", "csh", // Shell scripts
+            "py", "pl", "rb", "php", "js", // Scripts
+            "exe", "com", "bat", "cmd", // Windows executables
+            "so", "dylib", "dll", // Libraries
+            "deb", "rpm", "pkg", // Package files
+        ];
+        
+        if dangerous_extensions.contains(&ext_lower.as_str()) {
+            return Err(MediaForgeError::InvalidSettings(
+                format!("File type not allowed for conversion: .{}", ext_lower)
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Sanitizes file paths to prevent path traversal and ensure paths are within allowed directories
+fn sanitize_path(path: &str) -> Result<PathBuf, MediaForgeError> {
+    // Expand tilde to home directory
+    let expanded_path = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))  // Windows support
+            .unwrap_or_else(|_| "/home".to_string());
+        path.replacen("~", &home, 1)
+    } else {
+        path.to_string()
+    };
+    
+    let path_buf = PathBuf::from(&expanded_path);
+    
+    // Prevent path traversal attacks
+    for component in path_buf.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(MediaForgeError::InvalidSettings(
+                "Path traversal detected: '..' not allowed in paths".into()
+            ));
+        }
+    }
+    
+    // Check for other dangerous path components
+    if expanded_path.contains("//") || expanded_path.contains("\\\\") {
+        return Err(MediaForgeError::InvalidSettings(
+            "Invalid path: double separators not allowed".into()
+        ));
+    }
+    
+    // Ensure path is absolute or can be made absolute
+    let canonical_path = if path_buf.is_absolute() {
+        path_buf
+    } else {
+        std::env::current_dir()
+            .map_err(|e| MediaForgeError::FileSystemError(format!("Cannot get current directory: {}", e)))?
+            .join(path_buf)
+    };
+    
+    // Verify the parent directory exists or can be created
+    if let Some(parent) = canonical_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MediaForgeError::FileSystemError(format!("Cannot create directory: {}", e)))?;
+        }
+    }
+    
+    // Ensure path is within reasonable bounds (not system directories)
+    let path_str = canonical_path.to_string_lossy();
+    if path_str.starts_with("/etc") 
+        || path_str.starts_with("/sys") 
+        || path_str.starts_with("/proc")
+        || path_str.starts_with("/boot")
+        || path_str.starts_with("/root")  // Unless we're root
+        || path_str.contains("/.ssh/")
+        || path_str.contains("/.gnupg/")
+    {
+        return Err(MediaForgeError::InvalidSettings(
+            "Access to system directories is not allowed".into()
+        ));
+    }
+    
+    Ok(canonical_path)
+}
+
+/// Validates image format for ImageMagick security (prevent dangerous delegates)
+fn validate_image_format(input_path: &PathBuf, output_format: &str) -> Result<(), MediaForgeError> {
+    // Check input file extension
+    if let Some(input_ext) = input_path.extension().and_then(|e| e.to_str()) {
+        let input_ext_lower = input_ext.to_lowercase();
+        
+        // Allowed input formats (avoid potentially dangerous formats)
+        let safe_input_formats = [
+            "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif",
+            "ico", "psd", // Common safe formats
+        ];
+        
+        if !safe_input_formats.contains(&input_ext_lower.as_str()) {
+            return Err(MediaForgeError::InvalidSettings(
+                format!("Input image format not supported: .{}", input_ext_lower)
+            ));
+        }
+    }
+    
+    // Validate output format
+    let output_lower = output_format.to_lowercase();
+    let safe_output_formats = [
+        "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "ico"
+    ];
+    
+    if !safe_output_formats.contains(&output_lower.as_str()) {
+        return Err(MediaForgeError::InvalidSettings(
+            format!("Output image format not supported: .{}", output_format)
+        ));
+    }
+    
+    Ok(())
+}
 
 pub struct ConversionManager {
     tasks: Arc<DashMap<String, TaskProgress>>,
@@ -61,9 +213,21 @@ impl ConversionManager {
         app_handle: tauri::AppHandle,
     ) -> Result<Vec<String>, MediaForgeError> {
         log::info!("Starting conversion for {} files", request.input_files.len());
+        
+        // Validate output path before processing any files
+        let _sanitized_output_path = sanitize_path(&request.output_path)?;
+        
         let mut task_ids = Vec::new();
 
         for input_file in request.input_files.iter() {
+            // Validate each input file before creating task
+            validate_input_file(input_file)?;
+            
+            // Additional validation for image files
+            if request.conversion_type == ConversionType::Image {
+                validate_image_format(input_file, &request.output_format)?;
+            }
+            
             let file_name = input_file
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -128,20 +292,18 @@ impl ConversionManager {
         request: &ConvertRequest,
         app_handle: tauri::AppHandle,
     ) -> Result<(), MediaForgeError> {
+        // Re-validate inputs (defensive programming)
+        validate_input_file(input_file)?;
+        validate_image_format(input_file, &request.output_format)?;
+        
         let file_stem = input_file
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| MediaForgeError::InvalidSettings("Invalid input filename".to_string()))?;
 
-        // Expand tilde in output path
-        let output_path_str = if request.output_path.starts_with("~/") {
-            request.output_path.replacen("~", &std::env::var("HOME").unwrap_or_else(|_| "/home".to_string()), 1)
-        } else {
-            request.output_path.clone()
-        };
-
-        let output_path = PathBuf::from(&output_path_str)
-            .join(format!("{}.{}", file_stem, request.output_format));
+        // Use sanitized output path
+        let output_dir = sanitize_path(&request.output_path)?;
+        let output_path = output_dir.join(format!("{}.{}", file_stem, request.output_format));
 
         // Use ImageMagick 7+ for image conversion (just 'magick', not 'magick convert')
         let mut cmd = TokioCommand::new("magick");
@@ -212,20 +374,17 @@ impl ConversionManager {
         request: &ConvertRequest,
         app_handle: tauri::AppHandle,
     ) -> Result<(), MediaForgeError> {
+        // Re-validate inputs (defensive programming)
+        validate_input_file(input_file)?;
+        
         let file_stem = input_file
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| MediaForgeError::InvalidSettings("Invalid input filename".to_string()))?;
 
-        // Expand tilde in output path
-        let output_path_str = if request.output_path.starts_with("~/") {
-            request.output_path.replacen("~", &std::env::var("HOME").unwrap_or_else(|_| "/home".to_string()), 1)
-        } else {
-            request.output_path.clone()
-        };
-
-        let output_path = PathBuf::from(&output_path_str)
-            .join(format!("{}.{}", file_stem, request.output_format));
+        // Use sanitized output path
+        let output_dir = sanitize_path(&request.output_path)?;
+        let output_path = output_dir.join(format!("{}.{}", file_stem, request.output_format));
 
         log::info!("Starting video conversion from {:?} to {:?}", input_file, output_path);
 
@@ -341,20 +500,17 @@ impl ConversionManager {
         request: &ConvertRequest,
         app_handle: tauri::AppHandle,
     ) -> Result<(), MediaForgeError> {
+        // Re-validate inputs (defensive programming)
+        validate_input_file(input_file)?;
+        
         let file_stem = input_file
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| MediaForgeError::InvalidSettings("Invalid input filename".to_string()))?;
 
-        // Expand tilde in output path
-        let output_path_str = if request.output_path.starts_with("~/") {
-            request.output_path.replacen("~", &std::env::var("HOME").unwrap_or_else(|_| "/home".to_string()), 1)
-        } else {
-            request.output_path.clone()
-        };
-
-        let output_path = PathBuf::from(&output_path_str)
-            .join(format!("{}.{}", file_stem, request.output_format));
+        // Use sanitized output path
+        let output_dir = sanitize_path(&request.output_path)?;
+        let output_path = output_dir.join(format!("{}.{}", file_stem, request.output_format));
 
         log::info!("Starting audio conversion from {:?} to {:?}", input_file, output_path);
 
@@ -421,12 +577,72 @@ impl Clone for ConversionManager {
     }
 }
 
+/// FFmpeg progress tracker to calculate actual percentage based on duration
+struct FFmpegProgress {
+    duration_ms: Option<u64>,
+    current_ms: u64,
+}
+
+impl FFmpegProgress {
+    fn new() -> Self {
+        Self {
+            duration_ms: None,
+            current_ms: 0,
+        }
+    }
+    
+    fn parse_line(&mut self, line: &str) -> Option<f32> {
+        // Parse duration from FFmpeg output (appears early in the output)
+        // Format: "Duration: 00:01:23.45, start: 0.000000, bitrate: 1234 kb/s"
+        if line.contains("Duration:") {
+            let re = Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
+            if let Some(caps) = re.captures(line) {
+                let hours: u64 = caps[1].parse().unwrap_or(0);
+                let mins: u64 = caps[2].parse().unwrap_or(0);
+                let secs: u64 = caps[3].parse().unwrap_or(0);
+                let ms: u64 = caps[4].parse().unwrap_or(0) * 10; // Convert to ms
+                
+                self.duration_ms = Some((hours * 3600 + mins * 60 + secs) * 1000 + ms);
+                log::info!("FFmpeg detected duration: {} ms", self.duration_ms.unwrap());
+            }
+        }
+        
+        // Parse current time from progress output
+        // Format: "out_time_ms=12345678"
+        if line.starts_with("out_time_ms=") {
+            if let Some(ms_str) = line.strip_prefix("out_time_ms=") {
+                self.current_ms = ms_str.trim().parse().unwrap_or(0);
+                
+                // Calculate percentage if we have duration
+                if let Some(total) = self.duration_ms {
+                    if total > 0 {
+                        let progress = (self.current_ms as f32 / total as f32 * 100.0).min(100.0);
+                        return Some(progress);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+}
+
 fn parse_ffmpeg_progress(line: &str) -> Option<f32> {
-    // FFmpeg progress format: out_time_ms=12345678
+    // This is a simplified version - in practice, you'd want to maintain 
+    // a progress tracker per task. For now, we'll do basic parsing.
     if line.starts_with("out_time_ms=") {
-        // This is simplified - in production, you'd calculate percentage based on duration
-        // For now, we'll use a simple heuristic
-        return Some(50.0); // Placeholder
+        // Try to extract meaningful progress
+        if let Some(ms_str) = line.strip_prefix("out_time_ms=") {
+            if let Ok(current_ms) = ms_str.trim().parse::<u64>() {
+                // Rough heuristic: assume most conversions are < 10 minutes
+                // This is not accurate but better than always 50%
+                let estimated_total_ms = 600_000; // 10 minutes
+                let progress = (current_ms as f32 / estimated_total_ms as f32 * 100.0).min(100.0);
+                if progress > 0.0 && progress <= 100.0 {
+                    return Some(progress);
+                }
+            }
+        }
     }
     None
 }

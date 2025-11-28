@@ -56,7 +56,7 @@ pub struct TaskProgress {
     pub file_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ConversionType {
     Image,
     Video,

@@ -2,6 +2,7 @@ use crate::error::MediaForgeError;
 use crate::notifications;
 use crate::types::*;
 use dashmap::DashMap;
+use regex::Regex;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,6 +10,114 @@ use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
+
+/// Validates YouTube URL to prevent malicious schemes and ensure valid YouTube URLs
+fn validate_youtube_url(url: &str) -> Result<(), MediaForgeError> {
+    // Check for malicious schemes
+    if url.starts_with("file://") 
+        || url.starts_with("javascript:")
+        || url.starts_with("data:")
+        || url.starts_with("ftp://")
+        || url.contains('\n')
+        || url.contains('\r')
+        || url.contains(';')
+        || url.contains('&')
+        || url.contains('|')
+        || url.contains('`')
+        || url.contains('$')
+        || url.contains('(')
+        || url.contains(')')
+    {
+        return Err(MediaForgeError::InvalidUrl(
+            "URL contains potentially malicious characters or schemes".into()
+        ));
+    }
+    
+    // Valid YouTube URL patterns
+    let valid_patterns = vec![
+        r"^https?://(www\.)?youtube\.com/watch\?v=[\w-]{11}(&.*)?$",
+        r"^https?://youtu\.be/[\w-]{11}(\?.*)?$",
+        r"^https?://(www\.)?youtube\.com/playlist\?list=[\w-]+(&.*)?$",
+        r"^https?://(music\.)?youtube\.com/watch\?v=[\w-]{11}(&.*)?$",
+        r"^https?://(www\.)?youtube\.com/shorts/[\w-]{11}(\?.*)?$",
+    ];
+    
+    for pattern in valid_patterns {
+        let re = Regex::new(pattern).unwrap();
+        if re.is_match(url) {
+            return Ok(());
+        }
+    }
+    
+    Err(MediaForgeError::InvalidUrl(
+        "URL is not a valid YouTube URL".into()
+    ))
+}
+
+/// Sanitizes file paths to prevent path traversal and ensure paths are within allowed directories
+fn sanitize_path(path: &str) -> Result<PathBuf, MediaForgeError> {
+    // Expand tilde to home directory
+    let expanded_path = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))  // Windows support
+            .unwrap_or_else(|_| "/home".to_string());
+        path.replacen("~", &home, 1)
+    } else {
+        path.to_string()
+    };
+    
+    let path_buf = PathBuf::from(&expanded_path);
+    
+    // Prevent path traversal attacks
+    for component in path_buf.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(MediaForgeError::InvalidSettings(
+                "Path traversal detected: '..' not allowed in paths".into()
+            ));
+        }
+    }
+    
+    // Check for other dangerous path components
+    if expanded_path.contains("//") || expanded_path.contains("\\\\") {
+        return Err(MediaForgeError::InvalidSettings(
+            "Invalid path: double separators not allowed".into()
+        ));
+    }
+    
+    // Ensure path is absolute or can be made absolute
+    let canonical_path = if path_buf.is_absolute() {
+        path_buf
+    } else {
+        std::env::current_dir()
+            .map_err(|e| MediaForgeError::FileSystemError(format!("Cannot get current directory: {}", e)))?
+            .join(path_buf)
+    };
+    
+    // Verify the parent directory exists or can be created
+    if let Some(parent) = canonical_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MediaForgeError::FileSystemError(format!("Cannot create directory: {}", e)))?;
+        }
+    }
+    
+    // Ensure path is within reasonable bounds (not system directories)
+    let path_str = canonical_path.to_string_lossy();
+    if path_str.starts_with("/etc") 
+        || path_str.starts_with("/sys") 
+        || path_str.starts_with("/proc")
+        || path_str.starts_with("/boot")
+        || path_str.starts_with("/root")  // Unless we're root
+        || path_str.contains("/.ssh/")
+        || path_str.contains("/.gnupg/")
+    {
+        return Err(MediaForgeError::InvalidSettings(
+            "Access to system directories is not allowed".into()
+        ));
+    }
+    
+    Ok(canonical_path)
+}
 
 pub struct DownloadManager {
     tasks: Arc<DashMap<String, TaskProgress>>,
@@ -60,9 +169,15 @@ impl DownloadManager {
         request: DownloadRequest,
         app_handle: tauri::AppHandle,
     ) -> Result<Vec<String>, MediaForgeError> {
+        // Validate download path before processing any URLs
+        let _sanitized_path = sanitize_path(&request.download_path)?;
+        
         let mut task_ids = Vec::new();
 
         for url in request.urls.iter() {
+            // Validate each URL before creating task
+            validate_youtube_url(url)?;
+            
             let task_id = self.create_task(format!("Downloading from {}", url));
             task_ids.push(task_id.clone());
 
@@ -95,7 +210,9 @@ impl DownloadManager {
             task.status = TaskStatus::Downloading;
         });
 
-        let output_path = PathBuf::from(&request.download_path);
+        // Re-validate URL and sanitize path (defensive programming)
+        validate_youtube_url(url)?;
+        let output_path = sanitize_path(&request.download_path)?;
         let format_ext = match request.format {
             MediaFormat::Mp4 => "mp4",
             MediaFormat::Mp3 => "mp3",
@@ -279,4 +396,65 @@ fn parse_ytdlp_progress(line: &str) -> Option<ProgressInfo> {
         speed,
         eta,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_youtube_url_valid() {
+        // Valid YouTube URLs
+        assert!(validate_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("https://youtu.be/dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("https://www.youtube.com/playlist?list=PLrAXtmRdnEQy6nuLvTYpTNjVjYGD1UBx").is_ok());
+        assert!(validate_youtube_url("https://music.youtube.com/watch?v=dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_youtube_url_malicious() {
+        // Malicious URLs should be rejected
+        assert!(validate_youtube_url("file:///etc/passwd").is_err());
+        assert!(validate_youtube_url("javascript:alert(1)").is_err());
+        assert!(validate_youtube_url("data:text/plain,malicious").is_err());
+        assert!(validate_youtube_url("ftp://example.com/file").is_err());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=abc; rm -rf /").is_err());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=abc & echo hacked").is_err());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=abc\nrm -rf /").is_err());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=abc`whoami`").is_err());
+        assert!(validate_youtube_url("https://youtube.com/watch?v=abc$(whoami)").is_err());
+    }
+
+    #[test]
+    fn test_validate_youtube_url_invalid_domains() {
+        // Invalid domains should be rejected
+        assert!(validate_youtube_url("https://evil.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(validate_youtube_url("https://youtube.evil.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(validate_youtube_url("https://notyoutube.com/watch?v=dQw4w9WgXcQ").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_path_valid() {
+        // Valid paths should work
+        assert!(sanitize_path("/tmp/test").is_ok());
+        assert!(sanitize_path("./downloads").is_ok());
+    }
+
+    #[test]
+    fn test_sanitize_path_traversal() {
+        // Path traversal should be blocked
+        assert!(sanitize_path("../../../etc/passwd").is_err());
+        assert!(sanitize_path("/tmp/../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_path_system_directories() {
+        // System directories should be blocked
+        assert!(sanitize_path("/etc/shadow").is_err());
+        assert!(sanitize_path("/sys/kernel").is_err());
+        assert!(sanitize_path("/proc/self").is_err());
+        assert!(sanitize_path("/boot/grub").is_err());
+    }
 }
