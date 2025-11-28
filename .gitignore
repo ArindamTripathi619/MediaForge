@@ -51,4 +51,4 @@ Thumbs.db
 *.cache
 
 # Public folder (static assets served by Vite)
-public/
+# Keep it for development, but add specific ignores if needed

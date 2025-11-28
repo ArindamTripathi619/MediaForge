@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MediaForge
+Comment=YouTube Downloader & Media Converter
+Exec=mediaforge
+Icon=mediaforge
+Terminal=false
+Categories=AudioVideo;Audio;Video;Network;
+Keywords=youtube;download;converter;media;
+StartupWMClass=MediaForge
