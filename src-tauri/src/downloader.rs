@@ -12,6 +12,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn, error};
 use uuid::Uuid;
 
 /// Task handle for managing async download operations
@@ -237,7 +238,11 @@ impl DownloadManager {
                         result
                     }
                     _ = cancellation_token_clone.cancelled() => {
-                        log::info!("Task {} was cancelled", task_id_clone);
+                        info!(
+                            task_id = task_id_clone,
+                            url = %url,
+                            "Task was cancelled by user request"
+                        );
                         manager.update_task(&task_id_clone, |task| {
                             task.status = TaskStatus::Cancelled;
                             task.error = Some("Task was cancelled by user".to_string());
@@ -247,7 +252,12 @@ impl DownloadManager {
                         return;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(3600)) => {
-                        log::warn!("Task {} timed out after 1 hour", task_id_clone);
+                        warn!(
+                            task_id = task_id_clone,
+                            url = %url,
+                            timeout_seconds = 3600,
+                            "Download task timed out"
+                        );
                         manager.update_task(&task_id_clone, |task| {
                             task.status = TaskStatus::Failed;
                             task.error = Some("Download timed out after 1 hour".to_string());
@@ -259,7 +269,13 @@ impl DownloadManager {
                 };
                 
                 if let Err(e) = result {
-                    log::error!("Download failed for task {}: {}", task_id_clone, e);
+                    error!(
+                        task_id = task_id_clone,
+                        url = %url,
+                        error = %e,
+                        error_type = std::any::type_name_of_val(&e),
+                        "Download task failed with error"
+                    );
                     manager.update_task(&task_id_clone, |task| {
                         task.status = TaskStatus::Failed;
                         task.error = Some(e.to_string());
@@ -306,14 +322,25 @@ impl DownloadManager {
         
         // Cleanup on failure
         if let Err(ref error) = download_result {
-            log::error!("Download failed after retries for task {}: {}", task_id, error);
+            error!(
+                task_id = task_id,
+                url = %url,
+                error = %error,
+                retry_attempts_exhausted = true,
+                "Download failed after all retry attempts"
+            );
             let format_ext = match request.format {
                 MediaFormat::Mp4 => "mp4", 
                 MediaFormat::Mp3 => "mp3",
             };
             let potential_file = output_path.join(format!("*.{}", format_ext));
             // Try to cleanup any partial files - use a glob pattern would be better but for now just log
-            log::info!("Consider cleaning up potential partial files matching: {:?}", potential_file);
+            info!(
+                task_id = task_id,
+                cleanup_pattern = ?potential_file,
+                format = format_ext,
+                "Consider manual cleanup of potential partial files"
+            );
         }
         
         download_result
@@ -436,7 +463,10 @@ impl DownloadManager {
                         }
                     }
                     _ = cancellation_token_clone.cancelled() => {
-                        log::info!("Progress parsing cancelled for task {}", task_id_str);
+                        info!(
+                            task_id = task_id_str,
+                            "Progress parsing cancelled for task"
+                        );
                         break;
                     }
                 }
@@ -451,10 +481,17 @@ impl DownloadManager {
                 })?
             }
             _ = cancellation_token.cancelled() => {
-                log::info!("Killing yt-dlp process for cancelled task {}", task_id);
+                info!(
+                    task_id = task_id,
+                    "Terminating yt-dlp process for cancelled task"
+                );
                 // Kill the child process
                 if let Err(e) = child.kill().await {
-                    log::error!("Failed to kill yt-dlp process: {}", e);
+                    error!(
+                        task_id = task_id,
+                        error = %e,
+                        "Failed to terminate yt-dlp process"
+                    );
                 }
                 // Wait briefly for cleanup
                 let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
@@ -493,8 +530,13 @@ impl DownloadManager {
             let error_message = format!("Download failed with exit code: {:?}", status.code());
             let error = Self::classify_ytdlp_error(&error_message, status.code());
             
-            log::error!("yt-dlp failed for task {}: {} (retryable: {})", 
-                       task_id, error, error.is_retryable());
+            error!(
+                task_id = task_id,
+                error = %error,
+                exit_code = ?status.code(),
+                retryable = error.is_retryable(),
+                "yt-dlp process failed"
+            );
             
             Err(error)
         }
@@ -552,7 +594,10 @@ impl DownloadManager {
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
         // Cancel the running task if it exists
         if let Some((_, task_handle)) = self.task_handles.remove(task_id) {
-            log::info!("Cancelling task: {}", task_id);
+            info!(
+                task_id = task_id,
+                "Initiating task cancellation"
+            );
             
             // Update status first
             self.update_task(task_id, |task| {
@@ -562,18 +607,29 @@ impl DownloadManager {
             
             // Actually cancel the running task
             if let Err(e) = task_handle.cancel().await {
-                log::error!("Error cancelling task {}: {:?}", task_id, e);
+                error!(
+                    task_id = task_id,
+                    error = ?e,
+                    "Failed to cancel running task"
+                );
                 return Err(MediaForgeError::TaskNotFound(format!("Failed to cancel task: {:?}", e)));
             }
             
-            log::info!("Task {} cancelled successfully", task_id);
+            info!(
+                task_id = task_id,
+                "Task cancelled successfully"
+            );
         } else {
             // Task might not be running anymore, just update status
             self.update_task(task_id, |task| {
                 task.status = TaskStatus::Cancelled;
                 task.error = Some("Task cancelled by user".to_string());
             });
-            log::info!("Task {} not running, marked as cancelled", task_id);
+            info!(
+                task_id = task_id,
+                status = "not_running",
+                "Task not running, marked as cancelled"
+            );
         }
         
         Ok(())

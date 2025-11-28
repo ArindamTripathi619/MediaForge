@@ -12,6 +12,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn, error};
 use uuid::Uuid;
 
 /// Handle for managing conversion task lifecycle with cancellation support
@@ -239,7 +240,10 @@ impl ConversionManager {
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
         // Cancel the running task if it exists
         if let Some((_, task_handle)) = self.task_handles.remove(task_id) {
-            log::info!("Cancelling conversion task: {}", task_id);
+            info!(
+                task_id = task_id,
+                "Initiating conversion task cancellation"
+            );
             
             // Update status first
             self.update_task(task_id, |task| {
@@ -249,18 +253,29 @@ impl ConversionManager {
             
             // Actually cancel the running task
             if let Err(e) = task_handle.cancel().await {
-                log::error!("Error cancelling conversion task {}: {:?}", task_id, e);
+                error!(
+                    task_id = task_id,
+                    error = ?e,
+                    "Failed to cancel running conversion task"
+                );
                 return Err(MediaForgeError::TaskNotFound(format!("Failed to cancel task: {:?}", e)));
             }
             
-            log::info!("Conversion task {} cancelled successfully", task_id);
+            info!(
+                task_id = task_id,
+                "Conversion task cancelled successfully"
+            );
         } else {
             // Task might not be running anymore, just update status
             self.update_task(task_id, |task| {
                 task.status = TaskStatus::Cancelled;
                 task.error = Some("Task cancelled by user".to_string());
             });
-            log::info!("Conversion task {} not running, marked as cancelled", task_id);
+            info!(
+                task_id = task_id,
+                status = "not_running",
+                "Conversion task not running, marked as cancelled"
+            );
         }
         
         Ok(())
@@ -271,7 +286,12 @@ impl ConversionManager {
         request: ConvertRequest,
         app_handle: tauri::AppHandle,
     ) -> Result<Vec<String>, MediaForgeError> {
-        log::info!("Starting conversion for {} files", request.input_files.len());
+        info!(
+            file_count = request.input_files.len(),
+            output_format = ?request.output_format,
+            output_path = %request.output_path,
+            "Starting batch conversion"
+        );
         
         // Validate output path before processing any files
         let _sanitized_output_path = sanitize_path(&request.output_path)?;
@@ -291,7 +311,12 @@ impl ConversionManager {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown");
-            log::info!("Creating conversion task for: {}", file_name);
+            info!(
+                input_file = %input_file.display(),
+                file_name = file_name,
+                conversion_type = ?request.conversion_type,
+                "Creating conversion task"
+            );
             let task_id = self.create_task(format!("Converting {}", file_name));
             task_ids.push(task_id.clone());
 
@@ -312,7 +337,11 @@ impl ConversionManager {
             let cancellation_token_clone = cancellation_token.clone();
 
             let join_handle = tokio::spawn(async move {
-                log::info!("Spawned conversion task: {}", task_id_clone);
+                info!(
+                    task_id = task_id_clone,
+                    input_file = %input_file.display(),
+                    "Spawned conversion task worker"
+                );
                 
                 // Run the conversion with timeout and cancellation support
                 let result = tokio::select! {
@@ -320,7 +349,11 @@ impl ConversionManager {
                         result
                     }
                     _ = cancellation_token_clone.cancelled() => {
-                        log::info!("Conversion task {} was cancelled", task_id_clone);
+                        info!(
+                            task_id = task_id_clone,
+                            input_file = %input_file.display(),
+                            "Conversion task was cancelled by user"
+                        );
                         manager.update_task(&task_id_clone, |task| {
                             task.status = TaskStatus::Cancelled;
                             task.error = Some("Task was cancelled by user".to_string());
@@ -330,7 +363,12 @@ impl ConversionManager {
                         return;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(7200)) => { // 2 hour timeout for conversions
-                        log::warn!("Conversion task {} timed out after 2 hours", task_id_clone);
+                        warn!(
+                            task_id = task_id_clone,
+                            input_file = %input_file.display(),
+                            timeout_seconds = 7200,
+                            "Conversion task timed out"
+                        );
                         manager.update_task(&task_id_clone, |task| {
                             task.status = TaskStatus::Failed;
                             task.error = Some("Conversion timed out after 2 hours".to_string());
@@ -342,7 +380,13 @@ impl ConversionManager {
                 };
                 
                 if let Err(e) = result {
-                    log::error!("Conversion failed for {}: {}", task_id_clone, e);
+                    error!(
+                        task_id = task_id_clone,
+                        input_file = %input_file.display(),
+                        error = %e,
+                        error_type = std::any::type_name_of_val(&e),
+                        "Conversion task failed with error"
+                    );
                     manager.update_task(&task_id_clone, |task| {
                         task.status = TaskStatus::Failed;
                         task.error = Some(e.to_string());

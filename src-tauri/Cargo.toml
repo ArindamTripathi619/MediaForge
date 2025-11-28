@@ -37,3 +37,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 dashmap = "6.1"
 regex = "1.11"
+# Enhanced logging with structured tracing
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"

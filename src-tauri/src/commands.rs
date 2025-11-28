@@ -3,6 +3,8 @@ use crate::downloader::DownloadManager;
 use crate::system::*;
 use crate::types::*;
 use tauri::State;
+use tracing::{info, error, instrument};
+use uuid::Uuid;
 
 pub struct AppState {
     pub download_manager: DownloadManager,
@@ -10,26 +12,97 @@ pub struct AppState {
 }
 
 #[tauri::command]
+#[instrument]
 pub async fn check_dependencies() -> Result<SystemInfo, String> {
-    Ok(check_system_dependencies())
+    let correlation_id = Uuid::new_v4().to_string();
+    info!(
+        correlation_id = correlation_id,
+        command = "check_dependencies",
+        "Checking system dependencies"
+    );
+    
+    let result = check_system_dependencies();
+    info!(
+        correlation_id = correlation_id,
+        has_ytdlp = result.has_ytdlp,
+        has_ffmpeg = result.has_ffmpeg,
+        ytdlp_path = ?result.ytdlp_path,
+        ffmpeg_path = ?result.ffmpeg_path,
+        "System dependency check completed"
+    );
+    
+    Ok(result)
 }
 
 #[tauri::command]
+#[instrument]
 pub async fn install_ytdlp_command() -> Result<String, String> {
-    install_ytdlp()
+    let correlation_id = Uuid::new_v4().to_string();
+    info!(
+        correlation_id = correlation_id,
+        command = "install_ytdlp_command",
+        "Installing yt-dlp dependency"
+    );
+    
+    match install_ytdlp() {
+        Ok(result) => {
+            info!(
+                correlation_id = correlation_id,
+                "yt-dlp installation completed successfully"
+            );
+            Ok(result)
+        }
+        Err(e) => {
+            error!(
+                correlation_id = correlation_id,
+                error = %e,
+                "yt-dlp installation failed"
+            );
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
+#[instrument(skip(state, app_handle))]
 pub async fn start_download(
     request: DownloadRequest,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
-    state
+    let correlation_id = Uuid::new_v4().to_string();
+    info!(
+        correlation_id = correlation_id,
+        command = "start_download",
+        url_count = request.urls.len(),
+        format = ?request.format,
+        quality = ?request.quality,
+        "Starting download request"
+    );
+    
+    match state
         .download_manager
         .start_download(request, app_handle)
         .await
-        .map_err(|e| e.to_string())
+    {
+        Ok(task_ids) => {
+            info!(
+                correlation_id = correlation_id,
+                task_count = task_ids.len(),
+                task_ids = ?task_ids,
+                "Download tasks created successfully"
+            );
+            Ok(task_ids)
+        }
+        Err(e) => {
+            error!(
+                correlation_id = correlation_id,
+                error = %e,
+                "Failed to start download"
+            );
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -79,16 +152,45 @@ pub async fn remove_task(
 }
 
 #[tauri::command]
+#[instrument(skip(state, app_handle))]
 pub async fn start_conversion(
     request: ConvertRequest,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
-    state
+    let correlation_id = Uuid::new_v4().to_string();
+    info!(
+        correlation_id = correlation_id,
+        command = "start_conversion",
+        input_file_count = request.input_files.len(),
+        conversion_type = ?request.conversion_type,
+        output_format = ?request.output_format,
+        "Starting conversion request"
+    );
+    
+    match state
         .conversion_manager
         .start_conversion(request, app_handle)
         .await
-        .map_err(|e| e.to_string())
+    {
+        Ok(task_ids) => {
+            info!(
+                correlation_id = correlation_id,
+                task_count = task_ids.len(),
+                task_ids = ?task_ids,
+                "Conversion tasks created successfully"
+            );
+            Ok(task_ids)
+        }
+        Err(e) => {
+            error!(
+                correlation_id = correlation_id,
+                error = %e,
+                "Failed to start conversion"
+            );
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
