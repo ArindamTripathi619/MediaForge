@@ -16,7 +16,7 @@ pub enum MediaFormat {
     Mp3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskStatus {
     Queued,
     Downloading,

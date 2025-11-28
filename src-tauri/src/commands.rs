@@ -64,6 +64,7 @@ pub async fn cancel_download(
     state
         .download_manager
         .cancel_task(&task_id)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -103,6 +104,7 @@ pub async fn cancel_conversion(
     state
         .conversion_manager
         .cancel_task(&task_id)
+        .await
         .map_err(|e| e.to_string())
 }
 

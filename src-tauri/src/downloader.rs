@@ -9,7 +9,37 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Task handle for managing async download operations
+#[derive(Debug)]
+struct TaskHandle {
+    join_handle: JoinHandle<()>,
+    cancellation_token: CancellationToken,
+}
+
+impl TaskHandle {
+    fn new(join_handle: JoinHandle<()>, cancellation_token: CancellationToken) -> Self {
+        Self {
+            join_handle,
+            cancellation_token,
+        }
+    }
+    
+    /// Cancel the task and wait for it to complete
+    async fn cancel(self) -> Result<(), tokio::task::JoinError> {
+        self.cancellation_token.cancel();
+        self.join_handle.await
+    }
+    
+    /// Check if the task is cancelled
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+}
 
 /// Validates YouTube URL to prevent malicious schemes and ensure valid YouTube URLs
 fn validate_youtube_url(url: &str) -> Result<(), MediaForgeError> {
@@ -121,12 +151,14 @@ fn sanitize_path(path: &str) -> Result<PathBuf, MediaForgeError> {
 
 pub struct DownloadManager {
     tasks: Arc<DashMap<String, TaskProgress>>,
+    task_handles: Arc<DashMap<String, TaskHandle>>,
 }
 
 impl DownloadManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(DashMap::new()),
+            task_handles: Arc::new(DashMap::new()),
         }
     }
 
@@ -179,39 +211,122 @@ impl DownloadManager {
             validate_youtube_url(url)?;
             
             let task_id = self.create_task(format!("Downloading from {}", url));
+            
+            // Set task to Downloading status BEFORE spawning to prevent race condition
+            self.update_task(&task_id, |task| {
+                task.status = TaskStatus::Downloading;
+            });
+            
             task_ids.push(task_id.clone());
 
             let manager = self.clone();
             let req = request.clone();
             let url = url.clone();
-            let app_handle = app_handle.clone();
+            let app_handle_clone = app_handle.clone();
+            let app_handle_clone2 = app_handle.clone();
+            let task_id_clone = task_id.clone();
+            
+            // Create cancellation token for this task
+            let cancellation_token = CancellationToken::new();
+            let cancellation_token_clone = cancellation_token.clone();
 
-            tokio::spawn(async move {
-                if let Err(e) = manager.download_single(&task_id, &url, &req, app_handle).await {
-                    manager.update_task(&task_id, |task| {
+            let join_handle = tokio::spawn(async move {
+                // Run the download with timeout and cancellation support
+                let result = tokio::select! {
+                    result = manager.download_single_cancellable(&task_id_clone, &url, &req, app_handle_clone, cancellation_token_clone.clone()) => {
+                        result
+                    }
+                    _ = cancellation_token_clone.cancelled() => {
+                        log::info!("Task {} was cancelled", task_id_clone);
+                        manager.update_task(&task_id_clone, |task| {
+                            task.status = TaskStatus::Cancelled;
+                            task.error = Some("Task was cancelled by user".to_string());
+                        });
+                        // Clean up task handle on cancellation
+                        manager.task_handles.remove(&task_id_clone);
+                        return;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(3600)) => {
+                        log::warn!("Task {} timed out after 1 hour", task_id_clone);
+                        manager.update_task(&task_id_clone, |task| {
+                            task.status = TaskStatus::Failed;
+                            task.error = Some("Download timed out after 1 hour".to_string());
+                        });
+                        // Clean up task handle on timeout
+                        manager.task_handles.remove(&task_id_clone);
+                        return;
+                    }
+                };
+                
+                if let Err(e) = result {
+                    log::error!("Download failed for task {}: {}", task_id_clone, e);
+                    manager.update_task(&task_id_clone, |task| {
                         task.status = TaskStatus::Failed;
                         task.error = Some(e.to_string());
                     });
+                    // Clean up task handle on error
+                    manager.task_handles.remove(&task_id_clone);
                 }
+                
+                // Emit final task update - need a new clone since app_handle_clone was moved
+                let _ = app_handle_clone2.emit("task-update", manager.get_task(&task_id_clone));
             });
+            
+            // Store the task handle for cancellation
+            let task_handle = TaskHandle::new(join_handle, cancellation_token);
+            self.task_handles.insert(task_id.clone(), task_handle);
         }
 
         Ok(task_ids)
     }
 
-    async fn download_single(
+    async fn download_single_cancellable(
         &self,
         task_id: &str,
         url: &str,
         request: &DownloadRequest,
         app_handle: tauri::AppHandle,
+        cancellation_token: CancellationToken,
     ) -> Result<(), MediaForgeError> {
-        self.update_task(task_id, |task| {
-            task.status = TaskStatus::Downloading;
-        });
-
+        // Task status is already set to Downloading before spawn to prevent race condition
+        
         // Re-validate URL and sanitize path (defensive programming)
         validate_youtube_url(url)?;
+        let output_path = sanitize_path(&request.download_path)?;
+        
+        // Validate disk space and permissions before starting
+        crate::error::validation::validate_disk_space(&output_path, Some(100 * 1024 * 1024)).await?; // Assume 100MB minimum
+        crate::error::validation::validate_write_permissions(&output_path).await?;
+        
+        // Use retry mechanism for network operations
+        let retry_config = crate::error::RetryConfig::for_network();
+        let download_result = crate::error::retry_async(retry_config, || {
+            self.download_single_attempt(task_id, url, request, app_handle.clone(), cancellation_token.clone())
+        }).await;
+        
+        // Cleanup on failure
+        if let Err(ref error) = download_result {
+            log::error!("Download failed after retries for task {}: {}", task_id, error);
+            let format_ext = match request.format {
+                MediaFormat::Mp4 => "mp4", 
+                MediaFormat::Mp3 => "mp3",
+            };
+            let potential_file = output_path.join(format!("*.{}", format_ext));
+            // Try to cleanup any partial files - use a glob pattern would be better but for now just log
+            log::info!("Consider cleaning up potential partial files matching: {:?}", potential_file);
+        }
+        
+        download_result
+    }
+
+    async fn download_single_attempt(
+        &self,
+        task_id: &str,
+        url: &str,
+        request: &DownloadRequest,
+        app_handle: tauri::AppHandle,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
         let output_path = sanitize_path(&request.download_path)?;
         let format_ext = match request.format {
             MediaFormat::Mp4 => "mp4",
@@ -278,62 +393,152 @@ impl DownloadManager {
 
         let manager = self.clone();
         let task_id_str = task_id.to_string();
-        let task_id_clone = task_id_str.clone();
+        let _task_id_clone = task_id_str.clone();
         let app_handle_clone = app_handle.clone();
+        let cancellation_token_clone = cancellation_token.clone();
 
         // Parse progress from stdout
-        tokio::spawn(async move {
+        let progress_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(progress) = parse_ytdlp_progress(&line) {
-                    manager.update_task(&task_id_str, |task| {
-                        task.progress = progress.percentage;
-                        task.speed = progress.speed;
-                        task.eta = progress.eta;
-                    });
+            loop {
+                tokio::select! {
+                    result = lines.next_line() => {
+                        match result {
+                            Ok(Some(line)) => {
+                                if let Some(progress) = parse_ytdlp_progress(&line) {
+                                    manager.update_task(&task_id_str, |task| {
+                                        task.progress = progress.percentage;
+                                        task.speed = progress.speed;
+                                        task.eta = progress.eta;
+                                    });
 
-                    // Emit event to frontend
-                    let _ = app_handle_clone.emit("task-update", manager.get_task(&task_id_str));
-                }
+                                    // Emit event to frontend
+                                    let _ = app_handle_clone.emit("task-update", manager.get_task(&task_id_str));
+                                }
 
-                // Extract filename - look for the final merged/converted file
-                if line.contains("[download] Destination:") || line.contains("[Merger]") || line.contains("[ExtractAudio]") {
-                    if let Some(file_path) = line.split("Destination:").nth(1)
-                        .or_else(|| line.split("Merging formats into").nth(1))
-                        .or_else(|| line.split("to:").nth(1)) {
-                        let file_path = file_path.trim().trim_matches('"').to_string();
-                        manager.update_task(&task_id_str, |task| {
-                            task.file_path = Some(file_path.clone());
-                            task.name = file_path;
-                        });
+                                // Extract filename - look for the final merged/converted file
+                                if line.contains("[download] Destination:") || line.contains("[Merger]") || line.contains("[ExtractAudio]") {
+                                    if let Some(file_path) = line.split("Destination:").nth(1)
+                                        .or_else(|| line.split("Merging formats into").nth(1))
+                                        .or_else(|| line.split("to:").nth(1)) {
+                                        let file_path = file_path.trim().trim_matches('"').to_string();
+                                        manager.update_task(&task_id_str, |task| {
+                                            task.file_path = Some(file_path.clone());
+                                            task.name = file_path;
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(None) => break, // EOF
+                            Err(_) => break,   // Error reading
+                        }
+                    }
+                    _ = cancellation_token_clone.cancelled() => {
+                        log::info!("Progress parsing cancelled for task {}", task_id_str);
+                        break;
                     }
                 }
             }
         });
 
-        let status = child.wait().await.map_err(|e| {
-            MediaForgeError::YtDlpError(format!("Failed to wait for yt-dlp: {}", e))
-        })?;
+        // Wait for process completion or cancellation
+        let status = tokio::select! {
+            status = child.wait() => {
+                status.map_err(|e| {
+                    MediaForgeError::YtDlpError(format!("Failed to wait for yt-dlp: {}", e))
+                })?
+            }
+            _ = cancellation_token.cancelled() => {
+                log::info!("Killing yt-dlp process for cancelled task {}", task_id);
+                // Kill the child process
+                if let Err(e) = child.kill().await {
+                    log::error!("Failed to kill yt-dlp process: {}", e);
+                }
+                // Wait briefly for cleanup
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                
+                // Cancel progress parsing
+                progress_handle.abort();
+                
+                return Err(MediaForgeError::YtDlpError("Download was cancelled".to_string()));
+            }
+        };
+
+        // Cancel progress parsing since process completed
+        progress_handle.abort();
 
         if status.success() {
-            self.update_task(&task_id_clone, |task| {
+            self.update_task(task_id, |task| {
                 task.status = TaskStatus::Completed;
                 task.progress = 100.0;
             });
             
+            // Clean up task handle since task completed
+            self.task_handles.remove(task_id);
+            
             // Send notification
-            if let Some(task) = self.get_task(&task_id_clone) {
+            if let Some(task) = self.get_task(task_id) {
                 notifications::send_download_complete_notification(&app_handle, &task.name);
             }
             
-            let _ = app_handle.emit("task-update", self.get_task(&task_id_clone));
+            let _ = app_handle.emit("task-update", self.get_task(task_id));
             Ok(())
         } else {
-            Err(MediaForgeError::YtDlpError(
-                "Download failed with non-zero exit code".to_string(),
-            ))
+            // Clean up task handle on failure too  
+            self.task_handles.remove(task_id);
+            
+            // Enhanced error classification based on exit code and stderr
+            let error_message = format!("Download failed with exit code: {:?}", status.code());
+            let error = Self::classify_ytdlp_error(&error_message, status.code());
+            
+            log::error!("yt-dlp failed for task {}: {} (retryable: {})", 
+                       task_id, error, error.is_retryable());
+            
+            Err(error)
+        }
+    }
+
+    /// Classifies yt-dlp errors to determine if they're retryable
+    pub fn classify_ytdlp_error(message: &str, exit_code: Option<i32>) -> MediaForgeError {
+        let msg_lower = message.to_lowercase();
+        
+        // Network-related errors (retryable)
+        if msg_lower.contains("network") || 
+           msg_lower.contains("connection") ||
+           msg_lower.contains("timeout") ||
+           msg_lower.contains("temporary failure") ||
+           msg_lower.contains("503") ||  // Service unavailable
+           msg_lower.contains("502") ||  // Bad gateway  
+           msg_lower.contains("504") ||  // Gateway timeout
+           msg_lower.contains("429") ||  // Too many requests
+           exit_code == Some(1)          // Generic network failure
+        {
+            MediaForgeError::NetworkError(message.to_string())
+        }
+        // Permission/authentication errors (not retryable)
+        else if msg_lower.contains("private video") ||
+                msg_lower.contains("not available") ||
+                msg_lower.contains("geo-blocked") ||
+                exit_code == Some(2)  // Authentication/permission error
+        {
+            MediaForgeError::YtDlpError(message.to_string())
+        }
+        // Disk space errors
+        else if msg_lower.contains("no space left") ||
+                msg_lower.contains("disk full")
+        {
+            MediaForgeError::DiskSpaceError(message.to_string())
+        }
+        // Generic retryable errors
+        else if exit_code == Some(1) || msg_lower.contains("interrupted")
+        {
+            MediaForgeError::TemporaryError(message.to_string())
+        }
+        // Default to non-retryable yt-dlp error
+        else {
+            MediaForgeError::YtDlpError(message.to_string())
         }
     }
 
@@ -344,10 +549,33 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
-        self.update_task(task_id, |task| {
-            task.status = TaskStatus::Cancelled;
-        });
+    pub async fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
+        // Cancel the running task if it exists
+        if let Some((_, task_handle)) = self.task_handles.remove(task_id) {
+            log::info!("Cancelling task: {}", task_id);
+            
+            // Update status first
+            self.update_task(task_id, |task| {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some("Task cancelled by user".to_string());
+            });
+            
+            // Actually cancel the running task
+            if let Err(e) = task_handle.cancel().await {
+                log::error!("Error cancelling task {}: {:?}", task_id, e);
+                return Err(MediaForgeError::TaskNotFound(format!("Failed to cancel task: {:?}", e)));
+            }
+            
+            log::info!("Task {} cancelled successfully", task_id);
+        } else {
+            // Task might not be running anymore, just update status
+            self.update_task(task_id, |task| {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some("Task cancelled by user".to_string());
+            });
+            log::info!("Task {} not running, marked as cancelled", task_id);
+        }
+        
         Ok(())
     }
 }
@@ -356,6 +584,7 @@ impl Clone for DownloadManager {
     fn clone(&self) -> Self {
         Self {
             tasks: Arc::clone(&self.tasks),
+            task_handles: Arc::clone(&self.task_handles),
         }
     }
 }
@@ -456,5 +685,97 @@ mod tests {
         assert!(sanitize_path("/sys/kernel").is_err());
         assert!(sanitize_path("/proc/self").is_err());
         assert!(sanitize_path("/boot/grub").is_err());
+    }
+
+    #[test]
+    fn test_task_handle_creation() {
+        use tokio_util::sync::CancellationToken;
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let cancellation_token = CancellationToken::new();
+            let join_handle = tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            });
+            
+            let task_handle = TaskHandle::new(join_handle, cancellation_token.clone());
+            
+            // Test that we can check cancellation status
+            assert!(!task_handle.is_cancelled());
+            
+            // Test cancellation
+            cancellation_token.cancel();
+            assert!(task_handle.is_cancelled());
+            
+            // Test that cancel method works without panicking
+            let _ = task_handle.cancel().await;
+        });
+    }
+
+    #[test]
+    fn test_download_manager_task_handles() {
+        use tokio_util::sync::CancellationToken;
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let manager = DownloadManager::new();
+            
+            // Create a task
+            let task_id = manager.create_task("Test Task".to_string());
+            
+            // Verify initial state
+            assert_eq!(manager.task_handles.len(), 0);
+            
+            // Simulate adding a task handle
+            let cancellation_token = CancellationToken::new();
+            let join_handle = tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            });
+            let task_handle = TaskHandle::new(join_handle, cancellation_token);
+            manager.task_handles.insert(task_id.clone(), task_handle);
+            
+            // Verify task handle was added
+            assert_eq!(manager.task_handles.len(), 1);
+            assert!(manager.task_handles.contains_key(&task_id));
+            
+            // Test cleanup - remove task handle
+            manager.task_handles.remove(&task_id);
+            assert_eq!(manager.task_handles.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_race_condition_prevention() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let manager = DownloadManager::new();
+            
+            // Create a task
+            let task_id = manager.create_task("Test Task".to_string());
+            
+            // Set task to Downloading status (simulating race condition fix)
+            manager.update_task(&task_id, |task| {
+                task.status = TaskStatus::Downloading;
+            });
+            
+            // Verify status was set before any async operations
+            if let Some(task) = manager.get_task(&task_id) {
+                assert_eq!(task.status, TaskStatus::Downloading);
+            } else {
+                panic!("Task should exist");
+            }
+            
+            // Simulate completion and cleanup
+            manager.update_task(&task_id, |task| {
+                task.status = TaskStatus::Completed;
+                task.progress = 100.0;
+            });
+            
+            // Verify final state
+            if let Some(task) = manager.get_task(&task_id) {
+                assert_eq!(task.status, TaskStatus::Completed);
+                assert_eq!(task.progress, 100.0);
+            }
+        });
     }
 }

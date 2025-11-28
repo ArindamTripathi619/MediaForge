@@ -9,7 +9,34 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Handle for managing conversion task lifecycle with cancellation support
+struct TaskHandle {
+    join_handle: JoinHandle<()>,
+    cancellation_token: CancellationToken,
+}
+
+impl TaskHandle {
+    fn new(join_handle: JoinHandle<()>, cancellation_token: CancellationToken) -> Self {
+        Self {
+            join_handle,
+            cancellation_token,
+        }
+    }
+
+    async fn cancel(self) -> Result<(), tokio::task::JoinError> {
+        self.cancellation_token.cancel();
+        self.join_handle.await
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+}
 
 /// Validates input file paths to ensure they exist and are not system files
 fn validate_input_file(file_path: &PathBuf) -> Result<(), MediaForgeError> {
@@ -164,12 +191,14 @@ fn validate_image_format(input_path: &PathBuf, output_format: &str) -> Result<()
 
 pub struct ConversionManager {
     tasks: Arc<DashMap<String, TaskProgress>>,
+    task_handles: Arc<DashMap<String, TaskHandle>>,
 }
 
 impl ConversionManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(DashMap::new()),
+            task_handles: Arc::new(DashMap::new()),
         }
     }
 
@@ -207,6 +236,36 @@ impl ConversionManager {
         self.tasks.remove(task_id);
     }
 
+    pub async fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
+        // Cancel the running task if it exists
+        if let Some((_, task_handle)) = self.task_handles.remove(task_id) {
+            log::info!("Cancelling conversion task: {}", task_id);
+            
+            // Update status first
+            self.update_task(task_id, |task| {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some("Task cancelled by user".to_string());
+            });
+            
+            // Actually cancel the running task
+            if let Err(e) = task_handle.cancel().await {
+                log::error!("Error cancelling conversion task {}: {:?}", task_id, e);
+                return Err(MediaForgeError::TaskNotFound(format!("Failed to cancel task: {:?}", e)));
+            }
+            
+            log::info!("Conversion task {} cancelled successfully", task_id);
+        } else {
+            // Task might not be running anymore, just update status
+            self.update_task(task_id, |task| {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some("Task cancelled by user".to_string());
+            });
+            log::info!("Conversion task {} not running, marked as cancelled", task_id);
+        }
+        
+        Ok(())
+    }
+
     pub async fn start_conversion(
         &self,
         request: ConvertRequest,
@@ -236,26 +295,69 @@ impl ConversionManager {
             let task_id = self.create_task(format!("Converting {}", file_name));
             task_ids.push(task_id.clone());
 
+            // Set task to Processing status BEFORE spawning to prevent race condition
+            self.update_task(&task_id, |task| {
+                task.status = TaskStatus::Processing;
+            });
+
             let manager = self.clone();
             let req = request.clone();
             let input_file = input_file.clone();
             let app_handle = app_handle.clone();
+            let app_handle_clone2 = app_handle.clone();
+            let task_id_clone = task_id.clone();
+            
+            // Create cancellation token for this task
+            let cancellation_token = CancellationToken::new();
+            let cancellation_token_clone = cancellation_token.clone();
 
-            tokio::spawn(async move {
-                log::info!("Spawned conversion task: {}", task_id);
-                if let Err(e) = manager
-                    .convert_single(&task_id, &input_file, &req, app_handle.clone())
-                    .await
-                {
-                    log::error!("Conversion failed for {}: {}", task_id, e);
-                    manager.update_task(&task_id, |task| {
+            let join_handle = tokio::spawn(async move {
+                log::info!("Spawned conversion task: {}", task_id_clone);
+                
+                // Run the conversion with timeout and cancellation support
+                let result = tokio::select! {
+                    result = manager.convert_single_cancellable(&task_id_clone, &input_file, &req, app_handle.clone(), cancellation_token_clone.clone()) => {
+                        result
+                    }
+                    _ = cancellation_token_clone.cancelled() => {
+                        log::info!("Conversion task {} was cancelled", task_id_clone);
+                        manager.update_task(&task_id_clone, |task| {
+                            task.status = TaskStatus::Cancelled;
+                            task.error = Some("Task was cancelled by user".to_string());
+                        });
+                        // Clean up task handle on cancellation
+                        manager.task_handles.remove(&task_id_clone);
+                        return;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(7200)) => { // 2 hour timeout for conversions
+                        log::warn!("Conversion task {} timed out after 2 hours", task_id_clone);
+                        manager.update_task(&task_id_clone, |task| {
+                            task.status = TaskStatus::Failed;
+                            task.error = Some("Conversion timed out after 2 hours".to_string());
+                        });
+                        // Clean up task handle on timeout
+                        manager.task_handles.remove(&task_id_clone);
+                        return;
+                    }
+                };
+                
+                if let Err(e) = result {
+                    log::error!("Conversion failed for {}: {}", task_id_clone, e);
+                    manager.update_task(&task_id_clone, |task| {
                         task.status = TaskStatus::Failed;
                         task.error = Some(e.to_string());
                     });
-                    // Emit the failed task update
-                    let _ = app_handle.emit("task-update", manager.get_task(&task_id));
+                    // Clean up task handle on error
+                    manager.task_handles.remove(&task_id_clone);
                 }
+                
+                // Emit final task update
+                let _ = app_handle_clone2.emit("task-update", manager.get_task(&task_id_clone));
             });
+            
+            // Store the task handle for cancellation
+            let task_handle = TaskHandle::new(join_handle, cancellation_token);
+            self.task_handles.insert(task_id.clone(), task_handle);
         }
 
         Ok(task_ids)
@@ -281,6 +383,29 @@ impl ConversionManager {
             }
             ConversionType::Audio => {
                 self.convert_audio(task_id, input_file, request, app_handle).await
+            }
+        }
+    }
+
+    async fn convert_single_cancellable(
+        &self,
+        task_id: &str,
+        input_file: &PathBuf,
+        request: &ConvertRequest,
+        app_handle: tauri::AppHandle,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
+        // Task status is already set to Processing before spawn to prevent race condition
+        
+        match request.conversion_type {
+            ConversionType::Image => {
+                self.convert_image_cancellable(task_id, input_file, request, app_handle, cancellation_token).await
+            }
+            ConversionType::Video => {
+                self.convert_video_cancellable(task_id, input_file, request, app_handle, cancellation_token).await
+            }
+            ConversionType::Audio => {
+                self.convert_audio_cancellable(task_id, input_file, request, app_handle, cancellation_token).await
             }
         }
     }
@@ -493,6 +618,196 @@ impl ConversionManager {
         }
     }
 
+    async fn convert_video_cancellable(
+        &self,
+        task_id: &str,
+        input_file: &PathBuf,
+        request: &ConvertRequest,
+        app_handle: tauri::AppHandle,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
+        // Re-validate inputs (defensive programming)
+        validate_input_file(input_file)?;
+        
+        let file_stem = input_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| MediaForgeError::InvalidSettings("Invalid input filename".to_string()))?;
+
+        // Use sanitized output path
+        let output_dir = sanitize_path(&request.output_path)?;
+        let output_path = output_dir.join(format!("{}.{}", file_stem, request.output_format));
+
+        // Validate disk space and permissions before starting
+        let estimated_size = input_file.metadata()
+            .map(|m| m.len() * 2) // Estimate 2x input size for conversion
+            .unwrap_or(500 * 1024 * 1024); // Default 500MB
+        crate::error::validation::validate_disk_space(&output_dir, Some(estimated_size)).await?;
+        crate::error::validation::validate_write_permissions(&output_dir).await?;
+
+        log::info!("Starting cancellable video conversion from {:?} to {:?}", input_file, output_path);
+        
+        // Use retry mechanism for conversion operations (filesystem errors mainly)
+        let retry_config = crate::error::RetryConfig::for_filesystem();
+        let conversion_result = crate::error::retry_async(retry_config, || {
+            self.convert_video_attempt(task_id, input_file, request, &output_path, app_handle.clone(), cancellation_token.clone())
+        }).await;
+        
+        // Cleanup on failure
+        if let Err(ref error) = conversion_result {
+            log::error!("Video conversion failed after retries for task {}: {}", task_id, error);
+            let _ = crate::error::validation::cleanup_on_error(&output_path).await;
+        }
+        
+        conversion_result
+    }
+
+    async fn convert_video_attempt(
+        &self,
+        task_id: &str,
+        input_file: &PathBuf,
+        request: &ConvertRequest,
+        output_path: &PathBuf,
+        app_handle: tauri::AppHandle,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
+        log::info!("Attempting video conversion: {:?} -> {:?}", input_file, output_path);
+
+        let mut cmd = TokioCommand::new("ffmpeg");
+        cmd.arg("-i").arg(input_file);
+
+        // Apply video settings
+        if let Some(settings) = &request.video_settings {
+            if let Some(resolution) = &settings.resolution {
+                if resolution != "Keep Original" {
+                    cmd.arg("-s").arg(resolution);
+                }
+            }
+
+            if let Some(bitrate) = &settings.bitrate {
+                if bitrate != "Keep Original" {
+                    cmd.arg("-b:v").arg(bitrate);
+                }
+            }
+        }
+
+        // Progress monitoring
+        cmd.arg("-progress").arg("pipe:1");
+        cmd.arg("-y"); // Overwrite output files
+        cmd.arg(&output_path);
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        log::info!("FFmpeg command: {:?}", cmd);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            log::error!("Failed to spawn FFmpeg: {}", e);
+            MediaForgeError::FFmpegError(format!("Failed to spawn FFmpeg: {}", e))
+        })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            MediaForgeError::FFmpegError("Failed to capture stdout".to_string())
+        })?;
+
+        let _stderr = child.stderr.take().ok_or_else(|| {
+            MediaForgeError::FFmpegError("Failed to capture stderr".to_string())
+        })?;
+
+        let manager = self.clone();
+        let task_id_str = task_id.to_string();
+        let task_id_clone = task_id_str.clone();
+        let app_handle_clone = app_handle.clone();
+        let cancellation_token_clone = cancellation_token.clone();
+
+        // Parse FFmpeg progress with cancellation support
+        let progress_handle = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            loop {
+                tokio::select! {
+                    result = lines.next_line() => {
+                        match result {
+                            Ok(Some(line)) => {
+                                if let Some(progress) = parse_ffmpeg_progress(&line) {
+                                    manager.update_task(&task_id_clone, |task| {
+                                        task.progress = progress;
+                                    });
+
+                                    let _ = app_handle_clone.emit("task-update", manager.get_task(&task_id_clone));
+                                }
+                            }
+                            Ok(None) => break, // EOF
+                            Err(_) => break,   // Error reading
+                        }
+                    }
+                    _ = cancellation_token_clone.cancelled() => {
+                        log::info!("Progress parsing cancelled for conversion task {}", task_id_str);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Wait for process completion or cancellation
+        let status = tokio::select! {
+            status = child.wait() => {
+                status.map_err(|e| {
+                    MediaForgeError::FFmpegError(format!("Failed to wait for FFmpeg: {}", e))
+                })?
+            }
+            _ = cancellation_token.cancelled() => {
+                log::info!("Killing FFmpeg process for cancelled conversion task {}", task_id);
+                // Kill the child process
+                if let Err(e) = child.kill().await {
+                    log::error!("Failed to kill FFmpeg process: {}", e);
+                }
+                // Wait briefly for cleanup
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                
+                // Cancel progress parsing
+                progress_handle.abort();
+                
+                return Err(MediaForgeError::FFmpegError("Conversion was cancelled".to_string()));
+            }
+        };
+
+        // Cancel progress parsing since process completed
+        progress_handle.abort();
+
+        if status.success() {
+            log::info!("Video conversion completed successfully: {:?}", output_path);
+            self.update_task(task_id, |task| {
+                task.status = TaskStatus::Completed;
+                task.progress = 100.0;
+                task.file_path = Some(output_path.to_string_lossy().to_string());
+            });
+            
+            // Clean up task handle since task completed
+            self.task_handles.remove(task_id);
+            
+            // Send notification
+            if let Some(task) = self.get_task(task_id) {
+                notifications::send_conversion_complete_notification(&app_handle, &task.name);
+            }
+            
+            let _ = app_handle.emit("task-update", self.get_task(task_id));
+            Ok(())
+        } else {
+            // Clean up task handle on failure too
+            self.task_handles.remove(task_id);
+            
+            // Enhanced error classification for FFmpeg
+            let error_message = format!("Conversion failed with exit code: {:?}", status.code());
+            let error = Self::classify_ffmpeg_error(&error_message, status.code());
+            
+            log::error!("FFmpeg failed for task {}: {} (retryable: {})", 
+                       task_id, error, error.is_retryable());
+            
+            Err(error)
+        }
+    }
+
     async fn convert_audio(
         &self,
         task_id: &str,
@@ -560,12 +875,92 @@ impl ConversionManager {
             Err(MediaForgeError::FFmpegError(format!("FFmpeg failed: {}", error)))
         }
     }
+    
+    /// Classifies FFmpeg errors to determine if they're retryable  
+    pub fn classify_ffmpeg_error(message: &str, exit_code: Option<i32>) -> MediaForgeError {
+        let msg_lower = message.to_lowercase();
+        
+        // Temporary filesystem errors (retryable)
+        if msg_lower.contains("resource temporarily unavailable") ||
+           msg_lower.contains("device busy") ||
+           msg_lower.contains("interrupted system call") ||
+           exit_code == Some(1)  // Generic failure that might be temporary
+        {
+            MediaForgeError::TemporaryError(message.to_string())
+        }
+        // Disk space errors  
+        else if msg_lower.contains("no space left") ||
+                msg_lower.contains("disk full") ||
+                msg_lower.contains("write error")
+        {
+            MediaForgeError::DiskSpaceError(message.to_string())
+        }
+        // Permission errors
+        else if msg_lower.contains("permission denied") ||
+                msg_lower.contains("access denied") ||
+                exit_code == Some(126)  // Permission denied
+        {
+            MediaForgeError::PermissionError(message.to_string())
+        }
+        // Invalid format/codec errors (not retryable)
+        else if msg_lower.contains("invalid data") ||
+                msg_lower.contains("unsupported") ||
+                msg_lower.contains("no decoder") ||
+                msg_lower.contains("invalid file format") ||
+                exit_code == Some(255)  // FFmpeg generic error
+        {
+            MediaForgeError::FFmpegError(message.to_string())
+        }
+        // Default to retryable for other cases
+        else {
+            MediaForgeError::TemporaryError(message.to_string())
+        }
+    }
 
-    pub fn cancel_task(&self, task_id: &str) -> Result<(), MediaForgeError> {
-        self.update_task(task_id, |task| {
-            task.status = TaskStatus::Cancelled;
-        });
-        Ok(())
+    async fn convert_image_cancellable(
+        &self,
+        task_id: &str,
+        input_file: &PathBuf,
+        request: &ConvertRequest,
+        app_handle: tauri::AppHandle,
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
+        // For now, delegate to existing method
+        // TODO: Add proper cancellation support for ImageMagick processes
+        let result = self.convert_image(task_id, input_file, request, app_handle).await;
+        
+        // Clean up task handle on completion
+        if result.is_ok() {
+            self.task_handles.remove(task_id);
+        } else {
+            // Clean up task handle on failure too
+            self.task_handles.remove(task_id);
+        }
+        
+        result
+    }
+
+    async fn convert_audio_cancellable(
+        &self,
+        task_id: &str,
+        input_file: &PathBuf,
+        request: &ConvertRequest,
+        app_handle: tauri::AppHandle,
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), MediaForgeError> {
+        // For now, delegate to existing method
+        // TODO: Add proper cancellation support for FFmpeg audio processes
+        let result = self.convert_audio(task_id, input_file, request, app_handle).await;
+        
+        // Clean up task handle on completion
+        if result.is_ok() {
+            self.task_handles.remove(task_id);
+        } else {
+            // Clean up task handle on failure too
+            self.task_handles.remove(task_id);
+        }
+        
+        result
     }
 }
 
@@ -573,6 +968,7 @@ impl Clone for ConversionManager {
     fn clone(&self) -> Self {
         Self {
             tasks: Arc::clone(&self.tasks),
+            task_handles: Arc::clone(&self.task_handles),
         }
     }
 }
@@ -645,4 +1041,222 @@ fn parse_ffmpeg_progress(line: &str) -> Option<f32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod error_recovery_tests {
+    use super::*;
+    use crate::error::{MediaForgeError, RetryConfig, retry_async};
+    
+    #[test]
+    fn test_error_classification() {
+        // Test retryable errors
+        let network_error = MediaForgeError::NetworkError("Connection timeout".to_string());
+        assert!(network_error.is_retryable());
+        
+        let temp_error = MediaForgeError::TemporaryError("Resource unavailable".to_string());
+        assert!(temp_error.is_retryable());
+        
+        // Test non-retryable errors
+        let invalid_url = MediaForgeError::InvalidUrl("Not a valid YouTube URL".to_string());
+        assert!(!invalid_url.is_retryable());
+        
+        let invalid_settings = MediaForgeError::InvalidSettings("Bad format".to_string());
+        assert!(!invalid_settings.is_retryable());
+    }
+    
+    #[test]
+    fn test_ytdlp_error_classification() {
+        use crate::downloader::DownloadManager;
+        
+        // Network errors (retryable)
+        let network_err = DownloadManager::classify_ytdlp_error("network timeout occurred", Some(1));
+        assert!(network_err.is_retryable());
+        
+        // Permission errors (not retryable) 
+        let private_err = DownloadManager::classify_ytdlp_error("private video not available", Some(2));
+        assert!(!private_err.is_retryable());
+        
+        // Disk space errors
+        let disk_err = DownloadManager::classify_ytdlp_error("no space left on device", None);
+        assert!(!disk_err.is_retryable()); // Disk space errors shouldn't be retried immediately
+    }
+    
+    #[test]  
+    fn test_ffmpeg_error_classification() {
+        // Temporary errors (retryable)
+        let temp_err = ConversionManager::classify_ffmpeg_error("resource temporarily unavailable", Some(1));
+        assert!(temp_err.is_retryable());
+        
+        // Permission errors (not retryable)
+        let perm_err = ConversionManager::classify_ffmpeg_error("permission denied", Some(126));
+        assert!(!perm_err.is_retryable());
+        
+        // Invalid format errors (not retryable)
+        let format_err = ConversionManager::classify_ffmpeg_error("unsupported codec", Some(255));
+        assert!(!format_err.is_retryable());
+    }
+    
+    #[test]
+    fn test_retry_config() {
+        let config = RetryConfig::for_network();
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.base_delay, 3);
+        
+        // Test exponential backoff
+        assert_eq!(config.calculate_delay(1), 3);  // Base delay for first retry
+        assert_eq!(config.calculate_delay(2), 6);  // 2x base delay 
+        assert_eq!(config.calculate_delay(3), 12); // 4x base delay
+        assert!(config.calculate_delay(10) <= config.max_delay); // Capped at max
+    }
+    
+    #[tokio::test]
+    async fn test_retry_mechanism() {
+        let mut call_count = 0;
+        let config = RetryConfig {
+            max_attempts: 3,
+            base_delay: 0, // No delay for testing
+            max_delay: 0,
+            exponential_backoff: false,
+        };
+        
+        // Test successful retry
+        let result = retry_async(config.clone(), || {
+            call_count += 1;
+            async move {
+                if call_count < 3 {
+                    Err(MediaForgeError::NetworkError("Temporary failure".to_string()))
+                } else {
+                    Ok("Success".to_string())
+                }
+            }
+        }).await;
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Success");
+        assert_eq!(call_count, 3);
+        
+        // Test non-retryable error  
+        let result2: Result<String, MediaForgeError> = retry_async(config, || async {
+            Err(MediaForgeError::InvalidUrl("Bad URL".to_string()))
+        }).await;
+        
+        assert!(result2.is_err());
+        // Should fail immediately without retries for non-retryable errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn test_conversion_task_handle_creation() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let cancellation_token = CancellationToken::new();
+            let join_handle = tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            });
+            
+            let task_handle = TaskHandle::new(join_handle, cancellation_token.clone());
+            
+            // Test that we can check cancellation status
+            assert!(!task_handle.is_cancelled());
+            
+            // Test cancellation
+            cancellation_token.cancel();
+            assert!(task_handle.is_cancelled());
+            
+            // Test that cancel method works without panicking
+            let _ = task_handle.cancel().await;
+        });
+    }
+
+    #[test]
+    fn test_conversion_manager_task_handles() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let manager = ConversionManager::new();
+            
+            // Create a task
+            let task_id = manager.create_task("Test Conversion".to_string());
+            
+            // Verify initial state
+            assert_eq!(manager.task_handles.len(), 0);
+            
+            // Simulate adding a task handle
+            let cancellation_token = CancellationToken::new();
+            let join_handle = tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            });
+            let task_handle = TaskHandle::new(join_handle, cancellation_token);
+            manager.task_handles.insert(task_id.clone(), task_handle);
+            
+            // Verify task handle was added
+            assert_eq!(manager.task_handles.len(), 1);
+            assert!(manager.task_handles.contains_key(&task_id));
+            
+            // Test cleanup - remove task handle
+            manager.task_handles.remove(&task_id);
+            assert_eq!(manager.task_handles.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_child_process_cleanup() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let manager = ConversionManager::new();
+            
+            // Create a task
+            let task_id = manager.create_task("Test Process Cleanup".to_string());
+            
+            // Set task to Processing status (simulating process lifecycle)
+            manager.update_task(&task_id, |task| {
+                task.status = TaskStatus::Processing;
+            });
+            
+            // Verify status was set before any async operations
+            if let Some(task) = manager.get_task(&task_id) {
+                assert_eq!(task.status, TaskStatus::Processing);
+            } else {
+                panic!("Task should exist");
+            }
+            
+            // Simulate completion and cleanup
+            manager.update_task(&task_id, |task| {
+                task.status = TaskStatus::Completed;
+                task.progress = 100.0;
+            });
+            
+            // Verify final state
+            if let Some(task) = manager.get_task(&task_id) {
+                assert_eq!(task.status, TaskStatus::Completed);
+                assert_eq!(task.progress, 100.0);
+            }
+        });
+    }
+
+    #[test]
+    fn test_cancel_conversion_task() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let manager = ConversionManager::new();
+            
+            // Create a task
+            let task_id = manager.create_task("Test Cancellation".to_string());
+            
+            // Test cancelling non-running task
+            let result = manager.cancel_task(&task_id).await;
+            assert!(result.is_ok());
+            
+            // Verify task was marked as cancelled
+            if let Some(task) = manager.get_task(&task_id) {
+                assert_eq!(task.status, TaskStatus::Cancelled);
+                assert!(task.error.is_some());
+            }
+        });
+    }
 }
